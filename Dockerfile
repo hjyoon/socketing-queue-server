@@ -9,7 +9,6 @@ RUN npm ci --omit=dev --ignore-scripts \
   && npm cache clean --force
 
 COPY --chown=node:node index.js ./
-COPY --chown=node:node dist ./dist
 
 EXPOSE 3000
 

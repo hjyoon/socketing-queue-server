@@ -1,20 +1,12 @@
 import Fastify from "fastify";
 import fastifyEnv from "@fastify/env";
 import cors from "@fastify/cors";
-import fastifyStatic from "@fastify/static";
 import fastifyRedis from "@fastify/redis";
 import fastifyPostgres from "@fastify/postgres";
 // import fastifyRabbit from "fastify-rabbitmq";
-import { Server } from "socket.io";
-import { createAdapter } from "@socket.io/redis-adapter";
 import jwt from "jsonwebtoken";
-import { instrument } from "@socket.io/admin-ui";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { WebSocket, WebSocketServer } from "ws";
 import crypto from "node:crypto";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
 
 const schema = {
   type: "object",
@@ -63,6 +55,9 @@ const schema = {
 const createServiceUrl = (baseUrl, path) =>
   new URL(path, baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`).toString();
 
+const QUEUE_BROADCAST_CHANNEL = "socketing:queue:broadcast";
+const CLOSE_POLICY_VIOLATION = 1008;
+
 const fastify = Fastify({
   trustProxy: true,
   logger: true,
@@ -90,12 +85,6 @@ await fastify.register(fastifyPostgres, {
 // await fastify.register(fastifyRabbit, {
 //   connection: fastify.config.MQ_URL,
 // });
-
-await fastify.register(fastifyStatic, {
-  root: join(__dirname, "dist"),
-  prefix: "/admin",
-  redirect: true,
-});
 
 fastify.get("/liveness", (request, reply) => {
   reply.send({ status: "ok", message: "The server is alive." });
@@ -184,42 +173,107 @@ fastify.get("/readiness", async (request, reply) => {
   }
 });
 
-const pubClient = fastify.redis.duplicate();
-const subClient = fastify.redis.duplicate();
+const wsServer = new WebSocketServer({ server: fastify.server });
+const wsClients = new Map();
+const wsRooms = new Map();
+const queuePubClient = fastify.redis.duplicate();
+const queueSubClient = fastify.redis.duplicate();
 
-const io = new Server(fastify.server, {
-  cors: {
-    origin: "*",
-    methods: "*",
-    credentials: true,
-  },
-  transports: ["websocket"],
-  adapter: createAdapter(pubClient, subClient),
-});
+function sendRaw(ws, type, payload) {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type, payload }));
+}
 
-instrument(io, {
-  auth: {
-    type: "basic",
-    username: "admin",
-    password: "$2a$10$QWUn5UhhE3eSAu2a95fVn.PRVaamlJlJBMeT7viIrvgvfCOeUIV2W",
-  },
-  mode: "development",
-});
+function sendMessage(client, type, payload) {
+  sendRaw(client.ws, type, payload);
+}
 
-io.use((socket, next) => {
-  const token = socket.handshake.auth.token;
-
-  if (!token) {
-    return next(new Error("Authentication error"));
+function closeClient(client, code = 1000, reason = "") {
+  if (client.ws.readyState === WebSocket.OPEN) {
+    client.ws.close(code, reason);
   }
+}
 
+function addClientToRoom(client, roomName) {
+  client.rooms.add(roomName);
+  if (!wsRooms.has(roomName)) {
+    wsRooms.set(roomName, new Set());
+  }
+  wsRooms.get(roomName).add(client.id);
+}
+
+function removeClientFromRoom(client, roomName) {
+  client.rooms.delete(roomName);
+  const room = wsRooms.get(roomName);
+  if (!room) return;
+
+  room.delete(client.id);
+  if (room.size === 0) {
+    wsRooms.delete(roomName);
+  }
+}
+
+function removeClientFromAllRooms(client) {
+  for (const roomName of [...client.rooms]) {
+    removeClientFromRoom(client, roomName);
+  }
+}
+
+function getLocalRoomClients(roomName) {
+  const room = wsRooms.get(roomName);
+  if (!room) return [];
+
+  return [...room]
+    .map((socketId) => wsClients.get(socketId))
+    .filter((client) => client?.ws.readyState === WebSocket.OPEN);
+}
+
+function broadcastToRoom(roomName, type, payload) {
+  for (const client of getLocalRoomClients(roomName)) {
+    sendMessage(client, type, payload);
+  }
+}
+
+async function publishQueueMessage(message) {
+  await queuePubClient.publish(
+    QUEUE_BROADCAST_CHANNEL,
+    JSON.stringify(message),
+  );
+}
+
+async function handleQueueBroadcast(rawMessage) {
+  let message;
   try {
-    const decoded = jwt.verify(token, fastify.config.JWT_SECRET);
-    socket.data.user = decoded;
-    next();
-  } catch (err) {
-    return next(new Error("Authentication error"));
+    message = JSON.parse(rawMessage);
+  } catch (error) {
+    fastify.log.error(`Invalid queue broadcast message: ${error.message}`);
+    return;
   }
+
+  if (message.socketId) {
+    const client = wsClients.get(message.socketId);
+    if (!client) return;
+
+    sendMessage(client, message.type, message.payload);
+    if (message.disconnect) {
+      setTimeout(() => closeClient(client, 1000, "Token issued"), 50);
+    }
+    return;
+  }
+
+  if (!message.room) return;
+
+  if (message.type === "queueStatus") {
+    await broadcastQueueUpdate(message.room);
+    return;
+  }
+
+  broadcastToRoom(message.room, message.type, message.payload);
+}
+
+queueSubClient.on("message", (channel, rawMessage) => {
+  if (channel !== QUEUE_BROADCAST_CHANNEL) return;
+  void handleQueueBroadcast(rawMessage);
 });
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -270,7 +324,7 @@ async function broadcastQueueUpdate(queueName) {
   const socketsInRoom = await getSocketsInRoom(queueName);
   socketsInRoom.forEach((socket) => {
     const position = queue.findIndex((item) => item.socketId === socket.id) + 1;
-    socket.emit("updateQueue", {
+    sendMessage(socket, "updateQueue", {
       yourPosition: position,
       totalWaiting: queue.length,
     });
@@ -365,21 +419,7 @@ async function getRoomUserCount(roomName) {
 }
 
 async function getSocketsInRoom(queueName) {
-  const maxRetries = 30;
-  let delay = null;
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      return await io.in(queueName).fetchSockets();
-    } catch (err) {
-      console.error(
-        `Timeout reached, retrying (attempt ${attempt}/${maxRetries})...`,
-      );
-      await new Promise((resolve) => {
-        delay = decorrelatedJitter(100, 60000, delay);
-        setTimeout(resolve, delay);
-      });
-    }
-  }
+  return getLocalRoomClients(queueName);
 }
 
 async function getQueueLength(queueName) {
@@ -634,23 +674,18 @@ async function consumeStream() {
                   eventDateId,
                 );
 
-                io.to(firstClient.socketId).emit("tokenIssued", { token });
+                await publishQueueMessage({
+                  socketId: firstClient.socketId,
+                  type: "tokenIssued",
+                  payload: { token },
+                  disconnect: true,
+                });
                 fastify.log.info(
                   `Token issued to client ${firstClient.socketId}`,
                 );
 
-                // io.of("/").adapter.disconnectSockets(
-                //   {
-                //     rooms: new Set([firstClient.socketId]),
-                //     except: new Set(),
-                //   }, // 필터링 기준
-                //   true, // underlying connection 닫기
-                // );
-
-                // 개별 소켓 강제 종료 (보다 직관적)
-                io.sockets.sockets.get(firstClient.socketId)?.disconnect(true);
                 console.log(
-                  `Socket with ID ${firstClient.socketId} has been disconnected.`,
+                  `Token message published to socket ID ${firstClient.socketId}.`,
                 );
               }
             }
@@ -685,45 +720,115 @@ async function consumeStream() {
 // Start consuming the stream
 // await initializeStream();
 await waitRedisReady(); // ← Redis 준비 보장
+await queueSubClient.subscribe(QUEUE_BROADCAST_CHANNEL);
 await ensureGroup("$"); // ← 그룹/스트림 보장 ($: 이후 것부터)
 // Note: Not awaiting to allow it to run concurrently
 consumeStream(); // ← 그 다음에 소비 시작
 
-io.on("connection", (socket) => {
-  fastify.log.info(`New client connected: ${socket.id}`);
+async function handleJoinQueue(client, { eventId, eventDateId } = {}) {
+  if (!eventId || !eventDateId) {
+    sendMessage(client, "error", { message: "Invalid queue parameters." });
+    closeClient(client, CLOSE_POLICY_VIOLATION, "Invalid queue parameters");
+    return;
+  }
 
-  socket.on("joinQueue", async ({ eventId, eventDateId }) => {
-    if (!eventId || !eventDateId) {
-      socket.emit("error", { message: "Invalid queue parameters." });
-      socket.disconnect(true);
-      return;
-    }
+  const sub = client.data.user?.sub;
+  if (!sub) {
+    sendMessage(client, "error", { message: "Invalid user data." });
+    closeClient(client, CLOSE_POLICY_VIOLATION, "Invalid user data");
+    return;
+  }
 
-    const sub = socket.data.user?.sub;
-    if (!sub) {
-      socket.emit("error", { message: "Invalid user data." });
-      socket.disconnect(true);
-      return;
-    }
+  const roomName = `${eventId}_${eventDateId}`;
+  const queueName = `queue:${roomName}`;
 
-    const roomName = `${eventId}_${eventDateId}`;
-    const queueName = `queue:${roomName}`;
+  // 중복 연결 방지
+  if ((await findIndexInQueue(queueName, client.id, sub)) != -1) {
+    sendMessage(client, "error", { message: "Already in the queue." });
+    closeClient(client, CLOSE_POLICY_VIOLATION, "Already in the queue");
+    return;
+  }
 
-    // 중복 연결 방지
-    if ((await findIndexInQueue(queueName, socket.id, sub)) != -1) {
-      socket.emit("error", { message: "Already in the queue." });
-      socket.disconnect(true);
-      return;
-    }
+  try {
+    // 큐에 유저 추가
+    await addClientToQueue(queueName, client.id, sub);
+    addClientToRoom(client, queueName);
+    // await broadcastQueueUpdate(queueName);
 
-    try {
-      // 큐에 유저 추가
-      await addClientToQueue(queueName, socket.id, sub);
-      socket.join(queueName);
+    fastify.log.info(`Client ${client.id} joined queue: ${queueName}`);
+
+    // await fastify.redis.xadd(STREAM_KEY, "*", eventId, eventDateId);
+    await fastify.redis.xadd(
+      STREAM_KEY,
+      "*",
+      "eventId",
+      eventId,
+      "eventDateId",
+      eventDateId,
+    );
+
+    const jwtToken = jwt.sign(
+      {
+        jti: crypto.randomUUID(),
+        sub: "scheduling",
+        eventId,
+        eventDateId,
+      },
+      fastify.config.JWT_SECRET,
+      {
+        expiresIn: 600, // 10분
+      },
+    );
+
+    await fetch(
+      createServiceUrl(
+        fastify.config.SCHEDULING_SERVER_URL,
+        "scheduling/reservation/status",
+      ),
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${jwtToken}`, // JWT 토큰 추가
+        },
+      },
+    );
+
+    await fetch(
+      createServiceUrl(
+        fastify.config.SCHEDULING_SERVER_URL,
+        "scheduling/queue/status",
+      ),
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${jwtToken}`, // JWT 토큰 추가
+        },
+      },
+    );
+  } catch (err) {
+    fastify.log.error(
+      `Error processing queue for ${client.id}: ${err.message}`,
+    );
+    sendMessage(client, "error", { message: "Internal server error." });
+    closeClient(client, 1011, "Internal server error");
+  }
+}
+
+async function handleClientDisconnect(client) {
+  if (client.disconnectHandled) return;
+  client.disconnectHandled = true;
+
+  wsClients.delete(client.id);
+  removeClientFromAllRooms(client);
+
+  const sub = client.data.user?.sub;
+  if (!sub) return;
+
+  const keys = await scanForKeys("queue:*");
+  for (const queueName of keys) {
+    if ((await removeClientFromQueue(queueName, client.id, sub)) > 0) {
       // await broadcastQueueUpdate(queueName);
-
-      fastify.log.info(`Client ${socket.id} joined queue: ${queueName}`);
-
+      const [eventId, eventDateId] = queueName.split(":")[1].split("_");
       // await fastify.redis.xadd(STREAM_KEY, "*", eventId, eventDateId);
       await fastify.redis.xadd(
         STREAM_KEY,
@@ -733,103 +838,72 @@ io.on("connection", (socket) => {
         "eventDateId",
         eventDateId,
       );
-
-      const jwtToken = jwt.sign(
-        {
-          jti: crypto.randomUUID(),
-          sub: "scheduling",
-          eventId,
-          eventDateId,
-        },
-        fastify.config.JWT_SECRET,
-        {
-          expiresIn: 600, // 10분
-        },
-      );
-
-      await fetch(
-        createServiceUrl(
-          fastify.config.SCHEDULING_SERVER_URL,
-          "scheduling/reservation/status",
-        ),
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${jwtToken}`, // JWT 토큰 추가
-          },
-        },
-      );
-
-      await fetch(
-        createServiceUrl(
-          fastify.config.SCHEDULING_SERVER_URL,
-          "scheduling/queue/status",
-        ),
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${jwtToken}`, // JWT 토큰 추가
-          },
-        },
-      );
-    } catch (err) {
-      fastify.log.error(
-        `Error processing queue for ${socket.id}: ${err.message}`,
-      );
-      socket.emit("error", { message: "Internal server error." });
-      socket.disconnect(true);
+      break;
     }
-  });
-
-  socket.on("disconnect", async () => {
-    const sub = socket.data.user?.sub;
-    const keys = await scanForKeys("queue:*");
-    for (const queueName of keys) {
-      if ((await removeClientFromQueue(queueName, socket.id, sub)) > 0) {
-        // await broadcastQueueUpdate(queueName);
-        const [eventId, eventDateId] = queueName.split(":")[1].split("_");
-        // await fastify.redis.xadd(STREAM_KEY, "*", eventId, eventDateId);
-        await fastify.redis.xadd(
-          STREAM_KEY,
-          "*",
-          "eventId",
-          eventId,
-          "eventDateId",
-          eventDateId,
-        );
-        break;
-      }
-    }
-  });
-});
-
-// io.on("leave-room", async ({ room, id }) => {
-//   if (room != id) {
-//     const [eventId, eventDateId] = room.split("_");
-//     // await fastify.redis.xadd(STREAM_KEY, "*", eventId, eventDateId);
-//     await fastify.redis.xadd(
-//       STREAM_KEY,
-//       "*",
-//       "eventId",
-//       eventId,
-//       "eventDateId",
-//       eventDateId,
-//     );
-//   }
-// });
-
-io.of("/").adapter.on("leave-room", async (room, id) => {
-  if (room !== id) {
-    const [eventId, eventDateId] = room.split("_");
-    await fastify.redis.xadd(
-      STREAM_KEY,
-      "*",
-      "eventId",
-      eventId,
-      "eventDateId",
-      eventDateId,
-    );
   }
+}
+
+async function handleClientMessage(client, rawMessage) {
+  let message;
+  try {
+    message = JSON.parse(rawMessage.toString());
+  } catch {
+    sendMessage(client, "error", { message: "Invalid message format." });
+    return;
+  }
+
+  switch (message.type) {
+    case "joinQueue":
+      await handleJoinQueue(client, message.payload);
+      break;
+    default:
+      sendMessage(client, "error", { message: "Unknown message type." });
+  }
+}
+
+wsServer.on("connection", (ws, request) => {
+  const requestUrl = new URL(
+    request.url || "/",
+    `http://${request.headers.host || "localhost"}`,
+  );
+  const token = requestUrl.searchParams.get("token");
+
+  if (!token) {
+    sendRaw(ws, "error", { message: "Authentication error" });
+    ws.close(CLOSE_POLICY_VIOLATION, "Authentication error");
+    return;
+  }
+
+  let decoded;
+  try {
+    decoded = jwt.verify(token, fastify.config.JWT_SECRET);
+  } catch {
+    sendRaw(ws, "error", { message: "Authentication error" });
+    ws.close(CLOSE_POLICY_VIOLATION, "Authentication error");
+    return;
+  }
+
+  const client = {
+    id: crypto.randomUUID(),
+    ws,
+    data: { user: decoded },
+    rooms: new Set(),
+    disconnectHandled: false,
+  };
+
+  wsClients.set(client.id, client);
+  addClientToRoom(client, client.id);
+  sendMessage(client, "connected", { id: client.id });
+
+  fastify.log.info(`New WebSocket client connected: ${client.id}`);
+
+  ws.on("message", (rawMessage) => {
+    void handleClientMessage(client, rawMessage);
+  });
+
+  ws.on("close", () => {
+    void handleClientDisconnect(client);
+  });
 });
 
 const startServer = async () => {
@@ -862,10 +936,13 @@ async function gracefulShutdown(signal) {
   fastify.log.info(`Received signal: ${signal}. Starting graceful shutdown...`);
 
   try {
-    io.sockets.sockets.forEach((socket) => {
-      socket.disconnect(true);
-    });
-    fastify.log.info("All Socket.IO connections have been closed.");
+    for (const client of wsClients.values()) {
+      closeClient(client, 1001, "Server shutting down");
+    }
+    wsServer.close();
+    queuePubClient.disconnect();
+    queueSubClient.disconnect();
+    fastify.log.info("All WebSocket connections have been closed.");
 
     await fastify.close();
     fastify.log.info("Fastify server has been closed.");
