@@ -27,6 +27,7 @@ const schema = {
     "DB_URL",
     // "MQ_URL",
     "MAX_ROOM_CONNECTIONS",
+    "SCHEDULING_SERVER_URL",
   ],
   properties: {
     PORT: {
@@ -53,8 +54,14 @@ const schema = {
     MAX_ROOM_CONNECTIONS: {
       type: "integer",
     },
+    SCHEDULING_SERVER_URL: {
+      type: "string",
+    },
   },
 };
+
+const createServiceUrl = (baseUrl, path) =>
+  new URL(path, baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`).toString();
 
 const fastify = Fastify({
   trustProxy: true,
@@ -740,19 +747,31 @@ io.on("connection", (socket) => {
         },
       );
 
-      await fetch("https://socketing.hjyoon.me/scheduling/reservation/status", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${jwtToken}`, // JWT 토큰 추가
+      await fetch(
+        createServiceUrl(
+          fastify.config.SCHEDULING_SERVER_URL,
+          "scheduling/reservation/status",
+        ),
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${jwtToken}`, // JWT 토큰 추가
+          },
         },
-      });
+      );
 
-      await fetch("https://socketing.hjyoon.me/scheduling/queue/status", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${jwtToken}`, // JWT 토큰 추가
+      await fetch(
+        createServiceUrl(
+          fastify.config.SCHEDULING_SERVER_URL,
+          "scheduling/queue/status",
+        ),
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${jwtToken}`, // JWT 토큰 추가
+          },
         },
-      });
+      );
     } catch (err) {
       fastify.log.error(
         `Error processing queue for ${socket.id}: ${err.message}`,
