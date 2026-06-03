@@ -1,17 +1,20 @@
-FROM node:20-alpine
+FROM golang:1.25-alpine3.23 AS build
 
 WORKDIR /app
+RUN apk add --no-cache git
+COPY go.mod ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -mod=mod \
+  -tags="netgo,osusergo" \
+  -trimpath \
+  -buildvcs=false \
+  -ldflags="-s -w" \
+  -o /socketing-queue-server ./cmd/server
 
-ENV NODE_ENV=production
+FROM gcr.io/distroless/static-debian12:nonroot
 
-COPY package*.json ./
-RUN npm ci --omit=dev --ignore-scripts \
-  && npm cache clean --force
-
-COPY --chown=node:node index.js ./
-
+WORKDIR /app
+COPY --from=build /socketing-queue-server /app/socketing-queue-server
 EXPOSE 3000
-
-USER node
-
-CMD ["node", "index.js"]
+ENTRYPOINT ["/app/socketing-queue-server"]
