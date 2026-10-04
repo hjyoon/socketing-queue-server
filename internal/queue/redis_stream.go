@@ -8,7 +8,8 @@ import (
 )
 
 func (r *Redis) EnsureGroup(ctx context.Context) error {
-	err := r.c.XGroupCreateMkStream(ctx, streamKey, consumerGroup, "$").Err()
+	// Include requests queued while the consumer was initializing or recovering.
+	err := r.c.XGroupCreateMkStream(ctx, streamKey, consumerGroup, "0").Err()
 	if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
 		return err
 	}

@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"log"
 	"strings"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 )
 
 func (s *Service) consume(ctx context.Context, consumer string) {
+	delay := initialRetryDelay
 	for {
 		select {
 		case <-ctx.Done():
@@ -16,15 +18,32 @@ func (s *Service) consume(ctx context.Context, consumer string) {
 		default:
 		}
 		messages, err := s.cache.ReadStream(ctx, consumer)
+		if ctx.Err() != nil {
+			return
+		}
 		if err != nil {
+			s.consumerReady.Store(false)
+			log.Printf("read queue messages failed: %v; retrying in %s", err, delay)
 			if strings.Contains(err.Error(), "NOGROUP") {
-				_ = s.cache.EnsureGroup(ctx)
+				if !s.ensureConsumerGroup(ctx) {
+					return
+				}
 			}
+			if !waitForRetry(ctx, delay) {
+				return
+			}
+			delay = nextRetryDelay(delay)
 			continue
 		}
+		s.consumerReady.Store(true)
+		delay = initialRetryDelay
 		for _, msg := range messages {
-			_ = s.processStream(ctx, msg)
-			_ = s.cache.Ack(ctx, msg.ID)
+			if err := s.processStream(ctx, msg); err != nil {
+				log.Printf("process queue message %s failed: %v", msg.ID, err)
+			}
+			if err := s.cache.Ack(ctx, msg.ID); err != nil {
+				log.Printf("acknowledge queue message %s failed: %v", msg.ID, err)
+			}
 		}
 	}
 }

@@ -31,9 +31,26 @@ func (r *Redis) Publish(ctx context.Context, channel string, message any) error 
 
 func (r *Redis) Subscribe(ctx context.Context, channel string, cb func(string)) error {
 	sub := r.c.Subscribe(ctx, channel)
+	stop := context.AfterFunc(ctx, func() { _ = sub.Close() })
+	if _, err := sub.ReceiveTimeout(ctx, 5*time.Second); err != nil {
+		stop()
+		_ = sub.Close()
+		return err
+	}
 	go func() {
-		for msg := range sub.Channel() {
-			cb(msg.Payload)
+		defer stop()
+		defer sub.Close()
+		messages := sub.Channel()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg, ok := <-messages:
+				if !ok {
+					return
+				}
+				cb(msg.Payload)
+			}
 		}
 	}()
 	return nil

@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -12,12 +14,13 @@ import (
 )
 
 type Service struct {
-	cfg    Config
-	cache  Cache
-	store  Store
-	hub    *Hub
-	done   context.CancelFunc
-	client *http.Client
+	cfg           Config
+	cache         Cache
+	store         Store
+	hub           *Hub
+	done          context.CancelFunc
+	client        *http.Client
+	consumerReady atomic.Bool
 }
 
 func NewService(cfg Config, cache Cache, store Store) *Service {
@@ -30,11 +33,17 @@ func NewService(cfg Config, cache Cache, store Store) *Service {
 func (s *Service) Start(ctx context.Context) {
 	runCtx, cancel := context.WithCancel(ctx)
 	s.done = cancel
-	_ = s.cache.Subscribe(runCtx, broadcastChannel, s.handleBroadcast)
 	go func() {
-		if err := s.cache.EnsureGroup(runCtx); err != nil {
+		defer s.consumerReady.Store(false)
+		if !retry(runCtx, "subscribe to queue broadcasts", func() error {
+			return s.cache.Subscribe(runCtx, broadcastChannel, s.handleBroadcast)
+		}) {
 			return
 		}
+		if !s.ensureConsumerGroup(runCtx) {
+			return
+		}
+		log.Print("queue consumer started")
 		s.consume(runCtx, "consumer-"+auth.UUID())
 	}()
 }
@@ -43,9 +52,13 @@ func (s *Service) Stop() {
 	if s.done != nil {
 		s.done()
 	}
+	s.consumerReady.Store(false)
 }
 
 func (s *Service) Ready(c *gin.Context) error {
+	if !s.consumerReady.Load() {
+		return errors.New("queue consumer is not ready")
+	}
 	if err := s.cache.Ready(c.Request.Context()); err != nil {
 		return err
 	}

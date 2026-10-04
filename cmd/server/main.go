@@ -43,12 +43,12 @@ func main() {
 
 func healthcheck(port string) {
 	c := http.Client{Timeout: 2 * time.Second}
-	resp, err := c.Get("http://127.0.0.1:" + port + "/liveness")
+	resp, err := c.Get("http://127.0.0.1:" + port + "/readiness")
 	if err != nil {
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= http.StatusInternalServerError {
+	if resp.StatusCode != http.StatusOK {
 		os.Exit(1)
 	}
 }
